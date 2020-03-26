@@ -139,52 +139,52 @@ struct Lisp_Process
     /* Event-count of last such event reported.  */
     EMACS_INT update_tick;
     /* Size of carryover in decoding.  */
-    int decoding_carryover;
-    /* Hysteresis to try to read process output in larger blocks.
-       On some systems, e.g. GNU/Linux, Emacs is seen as
-       an interactive app also when reading process output, meaning
-       that process output can be read in as little as 1 byte at a
-       time.  Value is nanoseconds to delay reading output from
-       this process.  Range is 0 .. 50 * 1000 * 1000.  */
-    int read_output_delay;
-    /* Should we delay reading output from this process.
-       Initialized from `Vprocess_adaptive_read_buffering'.
-       0 = nil, 1 = t, 2 = other.  */
-    unsigned int adaptive_read_buffering : 2;
-    /* Skip reading this process on next read.  */
-    bool_bf read_output_skip : 1;
-    /* True means kill silently if Emacs is exited.
-       This is the inverse of the `query-on-exit' flag.  */
-    bool_bf kill_without_query : 1;
-    /* True if communicating through a pty.  */
-    bool_bf pty_flag : 1;
-    /* Flag to set coding-system of the process buffer from the
-       coding_system used to decode process output.  */
-    bool_bf inherit_coding_system_flag : 1;
-    /* Whether the process is alive, i.e., can be waited for.  Running
-       processes can be waited for, but exited and fake processes cannot.  */
-    bool_bf alive : 1;
-    /* Record the process status in the raw form in which it comes from `wait'.
-       This is to avoid consing in a signal handler.  The `raw_status_new'
-       flag indicates that `raw_status' contains a new status that still
-       needs to be synced to `status'.  */
-    bool_bf raw_status_new : 1;
-    /* Whether this is a nonblocking socket. */
-    bool_bf is_non_blocking_client : 1;
-    /* Whether this is a server or a client socket. */
-    bool_bf is_server : 1;
-    int raw_status;
-    /* The length of the socket backlog. */
-    int backlog;
-    /* The port number. */
-    int port;
-    /* The socket type. */
-    int socktype;
+      intmax_t decoding_carryover;
+      /* Hysteresis to try to read process output in larger blocks.
+         On some systems, e.g. GNU/Linux, Emacs is seen as
+         an interactive app also when reading process output, meaning
+         that process output can be read in as little as 1 byte at a
+         time.  Value is nanoseconds to delay reading output from
+         this process.  Range is 0 .. 50 * 1000 * 1000.  */
+      int read_output_delay;
+      /* Should we delay reading output from this process.
+         Initialized from `Vprocess_adaptive_read_buffering'.
+         0 = nil, 1 = t, 2 = other.  */
+      unsigned int adaptive_read_buffering : 2;
+      /* Skip reading this process on next read.  */
+      bool_bf read_output_skip : 1;
+      /* True means kill silently if Emacs is exited.
+         This is the inverse of the `query-on-exit' flag.  */
+      bool_bf kill_without_query : 1;
+      /* True if communicating through a pty.  */
+      bool_bf pty_flag : 1;
+      /* Flag to set coding-system of the process buffer from the
+         coding_system used to decode process output.  */
+      bool_bf inherit_coding_system_flag : 1;
+      /* Whether the process is alive, i.e., can be waited for.  Running
+         processes can be waited for, but exited and fake processes cannot.  */
+      bool_bf alive : 1;
+      /* Record the process status in the raw form in which it comes from `wait'.
+         This is to avoid consing in a signal handler.  The `raw_status_new'
+         flag indicates that `raw_status' contains a new status that still
+         needs to be synced to `status'.  */
+      bool_bf raw_status_new : 1;
+      /* Whether this is a nonblocking socket. */
+      bool_bf is_non_blocking_client : 1;
+      /* Whether this is a server or a client socket. */
+      bool_bf is_server : 1;
+      int raw_status;
+      /* The length of the socket backlog. */
+      int backlog;
+      /* The port number. */
+      int port;
+      /* The socket type. */
+      int socktype;
 
 #ifdef HAVE_GETADDRINFO_A
-    /* Whether the socket is waiting for response from an asynchronous
-       DNS call. */
-    struct gaicb *dns_request;
+      /* Whether the socket is waiting for response from an asynchronous
+         DNS call. */
+      struct gaicb *dns_request;
 #endif
 
 #ifdef HAVE_GNUTLS
@@ -299,6 +299,8 @@ extern Lisp_Object remove_slash_colon (Lisp_Object);
 
 extern void update_processes_for_thread_death (Lisp_Object);
 extern void dissociate_controlling_tty (void);
+
+extern void start_process_output_consumers();
 
 INLINE_HEADER_END
 

@@ -11697,12 +11697,15 @@ resize_mini_window (struct window *w, bool exact_p)
 	  height = (max_height / unit) * unit;
 	  init_iterator (&it, w, ZV, ZV_BYTE, NULL, DEFAULT_FACE_ID);
 	  move_it_vertically_backward (&it, height - unit);
+
 	  start = it.current.pos;
 	}
       else
 	SET_TEXT_POS (start, BEGV, BEGV_BYTE);
 
       SET_MARKER_FROM_TEXT_POS (w->start, start);
+
+      height = max(height, 2 * unit);
 
       if (EQ (Vresize_mini_windows, Qgrow_only))
 	{

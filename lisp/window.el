@@ -1620,6 +1620,8 @@ return the minimum pixel-size of WINDOW."
 	  value)
       (with-current-buffer (window-buffer window)
 	(cond
+	 ((window-minibuffer-p window)
+	  (* (if pixelwise (frame-char-height (window-frame window)) 1) 2))
 	 ((window-size-fixed-p window horizontal ignore)
 	  ;; The minimum size of a fixed size window is its size.
 	  (window-size window horizontal pixelwise))

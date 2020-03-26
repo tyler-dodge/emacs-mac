@@ -396,6 +396,8 @@ struct coding_detection_info
 };
 
 
+static const intmax_t PROCESS_OUTPUT_MAX = 4096;
+
 struct coding_system
 {
   /* ID number of the coding system.  This is an index to
@@ -489,8 +491,8 @@ struct coding_system
   int *charbuf;
   int charbuf_size, charbuf_used;
 
-  unsigned char carryover[64];
-  int carryover_bytes;
+  unsigned char carryover[PROCESS_OUTPUT_MAX];
+  intmax_t carryover_bytes;
 
   int default_char;
 

@@ -5590,7 +5590,7 @@ case "$opsys" in
    ## load commands added is not consistent but normally ranges from
    ## about 14 to about 34. Setting it high gets us plenty of slop and
    ## only costs about 1.5K of wasted binary space.
-   headerpad_extra=1000
+   headerpad_extra=1500
    if test "$HAVE_MACGUI" = "yes"; then
      AC_MSG_CHECKING(Mac OS X version max allowed >= 10.11)
      AC_CACHE_VAL(emacs_cv_mac_os_x_max_allowed_10_11,
