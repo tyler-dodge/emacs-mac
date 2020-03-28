@@ -282,7 +282,14 @@ static intmax_t read_process_output (Lisp_Object, int);
 static void create_pty (Lisp_Object);
 static void exec_sentinel (Lisp_Object, Lisp_Object);
 
-static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX * 5;
+static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX * 2;
+
+struct process_output_window {
+  struct timespec next_window;
+  int iterations;
+  int bytes;
+};
+
 struct process_output_buffer {
   pid_t pid;
   int channel;
@@ -290,16 +297,33 @@ struct process_output_buffer {
   bool completed;
   int bufferSize;
   int error;
+  int output_tick;
   bool released;
   char buffer[MAX_PROCESS_OUTPUT_BUFFER_SIZE + 1];
+  struct process_output_window window;
   struct process_output_buffer * prev;
   struct process_output_buffer * next;
 };
+
+bool process_output_window_exceeds(struct process_output_window * window) {
+  if (window->bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE || window->iterations > 0) {
+    return true;
+  }
+  return false;
+}
+
+void reset_output_window(struct process_output_window * window) {
+  struct timespec now = current_timespec();
+  window->next_window = timespec_add(now, make_timespec(0, 100000000));
+  window->iterations = 0;
+  window->bytes = 0;
+}
 
 static struct process_output_buffer * process_buffers = NULL;
 static pthread_mutex_t process_buffers_mutex;
 static int process_buffers_not_empty_fd[2] = { -1, -1 };
 static int process_buffers_ready_fd[2] = { -1, -1 };
+static int process_output_tick = 0;
 static bool process_buffers_ready_fd_has_notification = false;
 
 int process_buffers_ready_read_fd() {
@@ -364,16 +388,49 @@ struct process_output_buffer * get_process_output_buffer(int channel, int pid) {
 }
 
 
-int copy_process_output_ready(fd_set * destination) {
+int process_output_ready_get_fd() {
   int count;
-  int xerrno = errno;
+  struct process_output_buffer * buffer = process_buffers;
+  int fd = -1;
+  bool has_output = false;
+  struct timespec now = current_timespec();
+
+  do {
+    has_output = false;
+  while (fd == -1 && buffer != NULL) {
+    if (timespec_cmp(now, buffer->window.next_window) >= 0) {
+      reset_output_window(&buffer->window);
+    }
+    if ((buffer->bufferSize > 0 && !process_output_window_exceeds(&buffer->window)) || buffer->completed) {
+      if (buffer->completed || buffer->output_tick != process_output_tick) {
+        fd = buffer->fd;
+      }
+      has_output = true;
+    }
+      buffer = buffer->next;
+    }
+    if (fd == -1 && has_output) {
+      process_output_tick++;
+    }
+  } while(fd == -1 && has_output);
+  return fd;
+}
+
+int copy_process_output_ready(struct fd_set * destination) {
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
   FD_COPY(&process_output_ready_fds, destination);
-  count = process_output_ready_count;
+  int count = process_output_ready_count;
   while (pthread_mutex_unlock(&process_buffers_updated_mutex) != 0);
-  errno = xerrno;
   return count;
+}
 
+int locked_process_output_ready_get_fd() {
+  int xerrno = errno;
+  lock_process_output();
+  int output = process_output_ready_get_fd();
+  unlock_process_output();
+  errno = xerrno;
+  return output;
 }
 
 void clear_process_output_ready(int fd) {
@@ -406,22 +463,21 @@ void add_process_output_ready(int fd) {
   errno = xerrno;
 }
 
-struct timespec next_window;
-int window_bytes = 0;
 
-bool process_output_exceeded_window() {
-  if (window_bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE * 10) {
+struct process_output_window global_output_window;
+
+bool process_output_global_exceeded_window() {
+  if (global_output_window.bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE) {
     return true;
   }
   return false;
 }
 
-void process_output_check_window() {
+  void process_output_check_window() {
   struct timespec now = current_timespec();
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
-  if (timespec_cmp(now, next_window) > 0) {
-    next_window = timespec_add(now, make_timespec(1, 0));
-    window_bytes = 0;
+  if (timespec_cmp(now, global_output_window.next_window) > 0) {
+    reset_output_window(&global_output_window);
   }
   while (pthread_mutex_unlock(&process_buffers_updated_mutex) != 0);
 }
@@ -429,7 +485,8 @@ void process_output_check_window() {
 void process_output_add_iteration(int bytes_read) {
   int xerrno = errno;
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
-  window_bytes += bytes_read;
+  global_output_window.bytes += bytes_read;
+  global_output_window.iterations++;
   while (pthread_mutex_unlock(&process_buffers_updated_mutex) != 0);
 }
 
@@ -437,7 +494,7 @@ bool locked_process_output_exceeded_window() {
   bool output;
   int xerrno = errno;
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
-  output = process_output_exceeded_window();
+  output = process_output_global_exceeded_window();
   while (pthread_mutex_unlock(&process_buffers_updated_mutex) != 0);
   errno = xerrno;
   return output;
@@ -448,7 +505,7 @@ updated_process_output() {
   bool output;
   int xerrno = errno;
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
-  if (process_output_exceeded_window()) {
+  if (process_output_global_exceeded_window()) {
     output = false;
   } else {
     output = process_output_ready_count > 0;
@@ -463,7 +520,8 @@ process_output_before_select() {
   bool exceeded_window = locked_process_output_exceeded_window();
   process_output_check_window();
   lock_process_output();
-  if (exceeded_window) {
+  int fd = process_output_ready_get_fd();
+  if (fd == -1 || exceeded_window) {
     process_buffers_drain_ready_fd();
   }
   unlock_process_output();
@@ -471,21 +529,28 @@ process_output_before_select() {
 
 ptrdiff_t
 process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
-  bool exceeded_window = locked_process_output_exceeded_window();
+  bool exceeded_global_window = locked_process_output_exceeded_window();
   lock_process_output();
   struct process_output_buffer * buffer = get_process_output_buffer(channel, pid);
   if (buffer == NULL) {
     unlock_process_output();
     return 0;
   }
-  if (!buffer->completed && exceeded_window) {
-    errno = EAGAIN;
+  bool exceeded_process_window = process_output_window_exceeds(&buffer->window);
+
+  if (!buffer->completed && (exceeded_global_window || exceeded_process_window)) {
     unlock_process_output();
+    errno = EAGAIN;
     return -1;
   }
+
+  struct timespec now = current_timespec();
   char throwaway[1024];
   int bufferSize = 0;
   bool larger_than_buffer = buffer->bufferSize > nbyte;
+  if (buffer->bufferSize > 0) {
+    buffer->window.iterations++;
+  }
   if (larger_than_buffer) {
     memcpy(buf, (char *)buffer->buffer, nbyte);
     const int newSize = buffer->bufferSize - nbyte;
@@ -497,27 +562,31 @@ process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
     memcpy(buf, (char *)buffer->buffer, buffer->bufferSize);
     buffer->bufferSize = 0;
   }
+
+  buffer->window.bytes += bufferSize;
+  buffer->output_tick = process_output_tick;
+
   const bool completed = buffer->completed;
   const int fd = buffer->fd;
 
   if (bufferSize == 0) {
-      if (completed) {
-          if (!process_buffers_updated) {
-              if (emacs_write(process_buffers_not_empty_write_fd(), &throwaway, 1) > 0) {
-                  process_buffers_updated = true;
-              }
-          }
-          buffer->released = true;
-      } else {
-          buffer->error = 0;
-      }
-      clear_process_output_ready(fd);
-  } else {
+    if (completed) {
       if (!process_buffers_updated) {
-          if (emacs_write(process_buffers_not_empty_write_fd(), &throwaway, 1) > 0) {
-              process_buffers_updated = true;
-          }
+        if (emacs_write(process_buffers_not_empty_write_fd(), &throwaway, 1) > 0) {
+          process_buffers_updated = true;
+        }
       }
+      buffer->released = true;
+    } else {
+      buffer->error = 0;
+    }
+    clear_process_output_ready(fd);
+  } else {
+    if (!process_buffers_updated) {
+      if (emacs_write(process_buffers_not_empty_write_fd(), &throwaway, 1) > 0) {
+        process_buffers_updated = true;
+      }
+    }
   }
   const int saved_errno = buffer->error;
 
@@ -571,7 +640,9 @@ void process_output_track(int channel, int pid, int fd) {
   buffer->channel = channel;
   buffer->completed = false;
   buffer->released = false;
+  buffer->output_tick = process_output_tick;
   buffer->prev = NULL;
+  reset_output_window(&buffer->window);
 
   buffer->next = process_buffers;
   bool first_buffer = process_buffers == NULL;
@@ -596,24 +667,21 @@ void * process_output_thread(void * args) {
   fd_set ready_fds;
   fd_set outputting_fds;
   fd_set tracked_fds;
-  struct timespec output_next_window = current_timespec();
-  int output_window_bytes = 0;
-  int output_window_iterations = 0;
+  struct process_output_window output_window;
+  reset_output_window(&output_window);
 
   FD_ZERO(&ready_fds);
   FD_ZERO(&outputting_fds);
   FD_ZERO(&tracked_fds);
   while (1) {
     struct timespec now = current_timespec();
-    if (timespec_cmp(output_next_window, now) > 0) {
-      output_next_window = timespec_add(now, make_timespec(1, 0));
-      output_window_bytes = 0;
-      output_window_iterations = 0;
-    } else if (output_window_bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE * 10 || output_window_iterations > 10) {
-      struct timespec timeout = timespec_sub(output_next_window, now);
+    if (timespec_cmp(output_window.next_window, now) > 0) {
+      reset_output_window(&output_window);
+    } else if (output_window.iterations > 100) {
+      struct timespec timeout = timespec_sub(output_window.next_window, now);
       nanosleep(&timeout, NULL);
     }
-    output_window_iterations++;
+    output_window.iterations++;
     fd_set fds;
     FD_ZERO(&fds);
     int notify_fd = process_buffers_not_empty_read_fd();
@@ -632,7 +700,6 @@ void * process_output_thread(void * args) {
     int readingCount = 0;
     bool has_output = false;
     struct timespec buffer_timeout = make_timespec(10, 0);
-    const struct timespec DELAY_TIMEOUT = make_timespec(0, 100000000); // 10 ms
     while (buffer != NULL) {
       if (buffer->completed || buffer->bufferSize >= MAX_PROCESS_OUTPUT_BUFFER_SIZE) {
         struct process_output_buffer * next = buffer->next;
@@ -669,7 +736,6 @@ void * process_output_thread(void * args) {
         FD_SET(fd, &tracked_fds);
         updatedSize = emacs_read(fd, process_output_copy_buffer, outputSize);
         if (updatedSize > 0) {
-          output_window_bytes += updatedSize;
           FD_SET(fd, &outputting_fds);
         } else {
           FD_CLR(fd, &outputting_fds);
@@ -763,7 +829,7 @@ void start_process_output_consumers() {
     emacs_perror("Failed to create process output consumer");
   }
 
-  next_window = current_timespec();
+  reset_output_window(&global_output_window);
 }
 
 /* Number of bits set in connect_wait_mask.  */
@@ -6131,8 +6197,8 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
           }
 
           process_output_before_select();
-          bool process_output_ready = updated_process_output();
-          if (process_output_ready) {
+          int process_output_ready_fd = locked_process_output_ready_get_fd();
+          if (process_output_ready_fd != -1) {
             timeout = make_timespec(0, 0);
           }
 
@@ -8014,7 +8080,14 @@ status_notify (struct Lisp_Process *deleting_process,
 
   fd_set ready_buffers;
   FD_ZERO(&ready_buffers);
-  copy_process_output_ready(&ready_buffers);
+  if (deleting_process != NULL || wait_proc != NULL) {
+    copy_process_output_ready(&ready_buffers);
+ } else {
+    const int fd = locked_process_output_ready_get_fd();
+    if (fd >= 0) {
+      FD_SET(fd, &ready_buffers);
+    }
+  }
 
   FOR_EACH_PROCESS (tail, proc)
     {
