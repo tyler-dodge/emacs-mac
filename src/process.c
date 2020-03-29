@@ -306,7 +306,7 @@ struct process_output_buffer {
 };
 
 bool process_output_window_exceeds(struct process_output_window * window) {
-  if (window->bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE || window->iterations > 0) {
+  if (window->bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE || window->iterations > 1) {
     return true;
   }
   return false;
@@ -314,7 +314,7 @@ bool process_output_window_exceeds(struct process_output_window * window) {
 
 void reset_output_window(struct process_output_window * window) {
   struct timespec now = current_timespec();
-  window->next_window = timespec_add(now, make_timespec(0, 100000000));
+  window->next_window = timespec_add(now, make_timespec(0, 500000000));
   window->iterations = 0;
   window->bytes = 0;
 }
@@ -343,6 +343,9 @@ int process_buffers_not_empty_write_fd() {
 }
 
 int process_buffers_drain_ready_fd() {
+  if (!process_buffers_ready_fd_has_notification) {
+    return 0;
+  }
   char throwaway[1024];
   int output = emacs_read(process_buffers_ready_read_fd(), throwaway, 1024);
   if (output == -1) {
@@ -397,22 +400,25 @@ int process_output_ready_get_fd() {
 
   do {
     has_output = false;
-  while (fd == -1 && buffer != NULL) {
-    if (timespec_cmp(now, buffer->window.next_window) >= 0) {
-      reset_output_window(&buffer->window);
-    }
-    if ((buffer->bufferSize > 0 && !process_output_window_exceeds(&buffer->window)) || buffer->completed) {
-      if (buffer->completed || buffer->output_tick != process_output_tick) {
-        fd = buffer->fd;
+    while (fd == -1 && buffer != NULL) {
+      if (timespec_cmp(now, buffer->window.next_window) >= 0) {
+        reset_output_window(&buffer->window);
       }
-      has_output = true;
-    }
+      if ((buffer->bufferSize > 0 && !process_output_window_exceeds(&buffer->window)) || buffer->completed) {
+        if (!buffer->released && buffer->output_tick != process_output_tick) {
+          fd = buffer->fd;
+        }
+        has_output = true;
+      }
       buffer = buffer->next;
     }
     if (fd == -1 && has_output) {
       process_output_tick++;
     }
   } while(fd == -1 && has_output);
+  if (fd == -1) {
+    process_buffers_drain_ready_fd();
+  }
   return fd;
 }
 
@@ -473,7 +479,7 @@ bool process_output_global_exceeded_window() {
   return false;
 }
 
-  void process_output_check_window() {
+void process_output_check_window() {
   struct timespec now = current_timespec();
   while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
   if (timespec_cmp(now, global_output_window.next_window) > 0) {
@@ -502,23 +508,13 @@ bool locked_process_output_exceeded_window() {
 
 bool
 updated_process_output() {
-  bool output;
-  int xerrno = errno;
-  while (pthread_mutex_lock(&process_buffers_updated_mutex) != 0);
-  if (process_output_global_exceeded_window()) {
-    output = false;
-  } else {
-    output = process_output_ready_count > 0;
-  }
-  while (pthread_mutex_unlock(&process_buffers_updated_mutex) != 0);
-  errno = xerrno;
-  return output;
+  return process_output_ready_get_fd() != -1;
 }
 
 void
 process_output_before_select() {
-  bool exceeded_window = locked_process_output_exceeded_window();
   process_output_check_window();
+  bool exceeded_window = locked_process_output_exceeded_window();
   lock_process_output();
   int fd = process_output_ready_get_fd();
   if (fd == -1 || exceeded_window) {
@@ -765,7 +761,9 @@ void * process_output_thread(void * args) {
       }
 
       if (buffer->bufferSize > 0 || buffer->completed) {
-        has_output = true;
+        if (buffer->completed || !process_output_window_exceeds(&buffer->window)) {
+          has_output = true;
+        }
         readingCount++;
         add_process_output_ready(buffer->fd);
       }
@@ -780,9 +778,7 @@ void * process_output_thread(void * args) {
         }
       }
     } else {
-      if (process_buffers_ready_fd_has_notification) {
-        process_buffers_drain_ready_fd();
-      }
+      process_buffers_drain_ready_fd();
     }
     unlock_process_output();
 
@@ -5799,7 +5795,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
   enum { MINIMUM = -1, TIMEOUT, FOREVER } wait;
   int got_some_output = -1;
   uintmax_t prev_wait_proc_nbytes_read = wait_proc ? wait_proc->nbytes_read : 0;
-  bool updated_output;
+  int updated_output_fd;
 #if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
   bool retry_for_async;
 #endif
@@ -5922,7 +5918,8 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
       else
         timeout = make_timespec (wait < TIMEOUT ? 0 : 100000, 0);
 
-      updated_output = updated_process_output();
+      process_output_before_select();
+      updated_output_fd = locked_process_output_ready_get_fd();
       /* Normally we run timers here.
          But not if wait_for_cell; in those cases,
          the wait is supposed to be short,
@@ -5979,7 +5976,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
          available, notify the user of the change right away.  After
          this explicit check, we'll let the SIGCHLD handler zap
          timeout to get our attention.  */
-      if (updated_output || update_tick != process_tick)
+      if (updated_output_fd != -1 || update_tick != process_tick)
         {
           fd_set Atemp;
           fd_set Ctemp;
@@ -6000,7 +5997,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
           }
 
           process_output_before_select();
-          if (updated_output ||
+          if (updated_output_fd != -1 ||
 #ifdef HAVE_MACGUI
               mac_select (
                           max_fd + 1,
@@ -6196,9 +6193,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
             max_fd = max(max_fd, ready_fd);
           }
 
-          process_output_before_select();
-          int process_output_ready_fd = locked_process_output_ready_get_fd();
-          if (process_output_ready_fd != -1) {
+          if (updated_output_fd != -1) {
             timeout = make_timespec(0, 0);
           }
 
@@ -6407,7 +6402,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
         do_pending_window_change (0);
 
       /* Check for data from a process.  */
-      if (!updated_output && (no_avail || nfds == 0))
+      if (updated_output_fd == -1 && (no_avail || nfds == 0))
         continue;
 
       for (channel = 0; channel <= max_desc; ++channel)
