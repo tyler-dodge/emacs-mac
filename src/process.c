@@ -282,12 +282,13 @@ static intmax_t read_process_output (Lisp_Object, int);
 static void create_pty (Lisp_Object);
 static void exec_sentinel (Lisp_Object, Lisp_Object);
 
-static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX * 10;
+static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX * 2;
 
 struct process_output_window {
+  int fd;
   struct timespec next_window;
   int iterations;
-  int bytes;
+  intmax_t bytes;
 };
 
 struct process_output_buffer {
@@ -295,7 +296,7 @@ struct process_output_buffer {
   int channel;
   int fd;
   bool completed;
-  int bufferSize;
+  intmax_t buffer_size;
   int error;
   int output_tick;
   bool released;
@@ -306,7 +307,7 @@ struct process_output_buffer {
 };
 
 bool output_window_exceeds_threshold(struct process_output_window * window) {
-  if (window->iterations > 0) {
+  if (window->iterations > 10 || window->bytes > PROCESS_OUTPUT_MAX / 10) {
     return true;
   }
   return false;
@@ -416,7 +417,7 @@ int process_output_get_ready_fd() {
       if (timespec_cmp(now, buffer->window.next_window) >= 0) {
         output_window_reset(&buffer->window);
       }
-      if ((buffer->bufferSize > 0 && !output_window_exceeds_threshold(&buffer->window)) || buffer->completed) {
+      if ((buffer->buffer_size > 0 && !output_window_exceeds_threshold(&buffer->window)) || buffer->completed) {
         if (!buffer->released && buffer->output_tick != process_output_tick) {
           fd = buffer->fd;
         }
@@ -487,7 +488,7 @@ void process_output_buffer_set_ready_fd(struct process_output_buffer * buffer) {
 struct process_output_window global_output_window;
 
 bool global_output_window_exceeded_threshold() {
-  if (global_output_window.iterations > 20) {
+  if (global_output_window.bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE * 10) {
     return true;
   }
   return false;
@@ -552,30 +553,30 @@ process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
 
   struct timespec now = current_timespec();
   char throwaway[1024];
-  int bufferSize = 0;
-  bool larger_than_buffer = buffer->bufferSize > nbyte;
-  if (buffer->bufferSize > 0) {
+  intmax_t buffer_size = 0;
+  bool larger_than_buffer = buffer->buffer_size > nbyte;
+  if (buffer->buffer_size > 0) {
     buffer->window.iterations++;
   }
   if (larger_than_buffer) {
     memcpy(buf, (char *)buffer->buffer, nbyte);
-    const int newSize = buffer->bufferSize - nbyte;
+    const intmax_t newSize = buffer->buffer_size - nbyte;
     memcpy((char *)buffer->buffer, (char *)buffer->buffer + nbyte, newSize);
-    buffer->bufferSize = newSize;
-    bufferSize = nbyte;
-  } else if (buffer->bufferSize > 0) {
-    bufferSize = buffer->bufferSize;
-    memcpy(buf, (char *)buffer->buffer, buffer->bufferSize);
-    buffer->bufferSize = 0;
+    buffer->buffer_size = newSize;
+    buffer_size = nbyte;
+  } else if (buffer->buffer_size > 0) {
+    buffer_size = buffer->buffer_size;
+    memcpy(buf, (char *)buffer->buffer, buffer->buffer_size);
+    buffer->buffer_size = 0;
   }
 
-  buffer->window.bytes += bufferSize;
+  buffer->window.bytes += buffer_size;
   buffer->output_tick = process_output_tick;
 
   const bool completed = buffer->completed;
   const int fd = buffer->fd;
 
-  if (bufferSize == 0) {
+  if (buffer_size == 0) {
     if (completed) {
       if (!process_output_notify_has_notification) {
         if (emacs_write(process_output_notify_write_fd(), &throwaway, 1) > 0) {
@@ -597,9 +598,9 @@ process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
   const int saved_errno = buffer->error;
 
   process_output_mutex_unlock();
-  global_output_window_add_iteration(bufferSize);
+  global_output_window_add_iteration(buffer_size);
 
-  if (bufferSize == 0) {
+  if (buffer_size == 0) {
     if (completed && saved_errno == 0) {
       return 0;
     }
@@ -610,7 +611,7 @@ process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
     }
     return -1;
   }
-  return bufferSize;
+  return buffer_size;
 }
 
 void process_output_release_fd(int channel, int pid) {
@@ -642,13 +643,14 @@ void process_output_track_fd(int channel, int pid, int fd) {
   buffer->pid = pid;
   buffer->fd = fd;
   buffer->error = 0;
-  buffer->bufferSize = 0;
+  buffer->buffer_size = 0;
   buffer->channel = channel;
   buffer->completed = false;
   buffer->released = false;
   buffer->output_tick = process_output_tick;
   buffer->prev = NULL;
   output_window_reset(&buffer->window);
+  buffer->window.fd = buffer->fd;
 
   buffer->next = process_buffers;
   bool first_buffer = process_buffers == NULL;
@@ -707,7 +709,7 @@ void * process_output_consumer_thread(void * args) {
     bool has_output = false;
     struct timespec buffer_timeout = make_timespec(10, 0);
     while (buffer != NULL) {
-      if (buffer->completed || buffer->bufferSize >= MAX_PROCESS_OUTPUT_BUFFER_SIZE) {
+      if (buffer->completed || buffer->buffer_size >= MAX_PROCESS_OUTPUT_BUFFER_SIZE) {
         struct process_output_buffer * next = buffer->next;
         if (buffer->released) {
           FD_CLR(buffer->fd, &tracked_fds);
@@ -735,8 +737,8 @@ void * process_output_consumer_thread(void * args) {
         maxFd = fd;
       }
       FD_SET(fd, &fds);
-      const int outputSize = MAX_PROCESS_OUTPUT_BUFFER_SIZE - buffer->bufferSize;
-      int updatedSize;
+      const intmax_t outputSize = MAX_PROCESS_OUTPUT_BUFFER_SIZE - buffer->buffer_size;
+      intmax_t updatedSize;
       if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds)) {
         process_output_mutex_unlock();
         FD_SET(fd, &tracked_fds);
@@ -753,8 +755,8 @@ void * process_output_consumer_thread(void * args) {
       }
 
       if (updatedSize > 0) {
-        // bufferSize should only decrease between locks so this'll be fine.
-        memcpy(buffer->buffer + buffer->bufferSize, process_output_consumer_copy_buffer, updatedSize);
+        // buffer_size should only decrease between locks so this'll be fine.
+        memcpy(buffer->buffer + buffer->buffer_size, process_output_consumer_copy_buffer, updatedSize);
       }
 
       if (errno != 0) {
@@ -763,14 +765,14 @@ void * process_output_consumer_thread(void * args) {
         buffer->error = 0;
       }
       if (updatedSize > 0) {
-        buffer->bufferSize += updatedSize;
+        buffer->buffer_size += updatedSize;
       }
 
       if (updatedSize == 0 || (updatedSize == -1 && !would_block(buffer->error))) {
         buffer->completed = true;
       }
 
-      if (buffer->bufferSize > 0 || buffer->completed) {
+      if (buffer->buffer_size > 0 || buffer->completed) {
         if (buffer->completed || !output_window_exceeds_threshold(&buffer->window)) {
           has_output = true;
         }
@@ -836,6 +838,7 @@ void start_process_output_consumer_thread() {
   }
 
   output_window_reset(&global_output_window);
+  global_output_window.fd = -1;
 }
 
 /* Number of bits set in connect_wait_mask.  */
@@ -4232,17 +4235,13 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
         BUF_ZV (XBUFFER (p->buffer)),
         BUF_ZV_BYTE (XBUFFER (p->buffer)));
 
-  if (!p->is_server) {
-      process_output_track_fd(p->infd, p->pid, p->infd);
-  }
-
   if (p->is_non_blocking_client)
   {
-      /* We may get here if connect did succeed immediately.  However,
-         in that case, we still need to signal this like a non-blocking
-         connection.  */
-      if (! (connecting_status (p->status)
-                      && EQ (XCDR (p->status), addrinfos)))
+    /* We may get here if connect did succeed immediately.  However,
+       in that case, we still need to signal this like a non-blocking
+       connection.  */
+    if (! (connecting_status (p->status)
+            && EQ (XCDR (p->status), addrinfos)))
           pset_status (p, Fcons (Qconnect, addrinfos));
       if ((fd_callback_info[inch].flags & NON_BLOCKING_CONNECT_FD) == 0)
           add_non_blocking_write_fd (inch);
@@ -4807,8 +4806,10 @@ usage: (make-network-process &rest ARGS)  */)
     p->backlog = XFIXNUM (server);
 
   /* :nowait BOOL */
-  if (!p->is_server && socktype != SOCK_DGRAM && nowait)
+  if (!p->is_server && socktype != SOCK_DGRAM && nowait) {
     p->is_non_blocking_client = true;
+    process_output_track_fd(p->infd, p->pid, p->infd);
+  }
 
   bool postpone_connection = false;
 #ifdef HAVE_GETADDRINFO_A
@@ -5619,8 +5620,8 @@ server_accept_connection (Lisp_Object server, int channel)
 
   /* Client processes for accepted connections are not stopped initially.  */
   if (!EQ (p->filter, Qt)) {
-      process_output_track_fd(p->infd, p->pid, p->infd);
-      add_process_read_fd (s);
+    add_non_keyboard_read_fd(s);
+    add_process_read_fd (s);
   }
   if (s > max_desc)
       max_desc = s;
@@ -6411,7 +6412,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
         do_pending_window_change (0);
 
       /* Check for data from a process.  */
-      if (updated_output_fd == -1 && (no_avail || nfds == 0))
+      if (no_avail || nfds == 0)
         continue;
 
       for (channel = 0; channel <= max_desc; ++channel)
@@ -6595,8 +6596,9 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
                     }
 
                   if (0 <= p->infd && !EQ (p->filter, Qt)
-                      && !EQ (p->command, Qt))
+                      && !EQ (p->command, Qt)) {
                     add_process_read_fd (p->infd);
+                  }
                 }
             }
         }			/* End for each file descriptor.  */
@@ -6700,11 +6702,11 @@ read_process_output (Lisp_Object proc, int channel)
             readmax);
       else
 #endif
-          if (p->is_server) {
-              emacs_read(channel, process_output_buffer + carryover, readmax);
-          } else {
-              nbytes = process_output_read(channel, p->pid, process_output_buffer + carryover, readmax);
-          }
+        if (p->is_server || (NETCONN1_P(p) && !p->is_non_blocking_client)) {
+          nbytes = emacs_read(channel, process_output_buffer + carryover, readmax);
+        } else {
+          nbytes = process_output_read(channel, p->pid, process_output_buffer + carryover, readmax);
+        }
 
       if (nbytes > 0 && p->adaptive_read_buffering)
         {

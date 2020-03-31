@@ -396,7 +396,7 @@ struct coding_detection_info
 };
 
 
-static const intmax_t PROCESS_OUTPUT_MAX = 1024 * 1024;
+static const intmax_t PROCESS_OUTPUT_MAX = 1024 * 1024 * 5;
 
 struct coding_system
 {
@@ -491,7 +491,7 @@ struct coding_system
   int *charbuf;
   int charbuf_size, charbuf_used;
 
-  unsigned char carryover[PROCESS_OUTPUT_MAX];
+  unsigned char carryover[64];
   intmax_t carryover_bytes;
 
   int default_char;
