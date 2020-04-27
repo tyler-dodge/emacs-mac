@@ -7406,6 +7406,8 @@ do hash-consing of the objects allocated to pure space.  */);
   DEFSYM (Qvector_slots, "vector-slots");
   DEFSYM (Qheap, "heap");
   DEFSYM (QAutomatic_GC, "Automatic GC");
+  DEFSYM (QThrottle_Strings_GC, "Throttle Strings GC");
+  DEFSYM (QThrottle_Conses_GC, "Throttle Conses GC");
 
   DEFSYM (Qgc_cons_percentage, "gc-cons-percentage");
   DEFSYM (Qgc_cons_threshold, "gc-cons-threshold");

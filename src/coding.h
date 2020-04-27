@@ -396,7 +396,7 @@ struct coding_detection_info
 };
 
 
-static const intmax_t PROCESS_OUTPUT_MAX = 1024 * 1024 * 5;
+static const intmax_t PROCESS_OUTPUT_MAX = 1024 * 1024 * 500;
 
 struct coding_system
 {

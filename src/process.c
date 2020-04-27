@@ -282,13 +282,15 @@ static intmax_t read_process_output (Lisp_Object, int);
 static void create_pty (Lisp_Object);
 static void exec_sentinel (Lisp_Object, Lisp_Object);
 
-static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX * 2;
+static const intmax_t MAX_PROCESS_OUTPUT_BUFFER_SIZE = PROCESS_OUTPUT_MAX;
 
 struct process_output_window {
   int fd;
   struct timespec next_window;
   int iterations;
   intmax_t bytes;
+  intmax_t output_max;
+  struct timespec time;
 };
 
 struct process_output_buffer {
@@ -306,8 +308,13 @@ struct process_output_buffer {
   struct process_output_buffer * next;
 };
 
+struct timespec output_window_timeslice;
+struct timespec output_window_slow_timeslice;
+struct timespec output_window_fast_timeslice;
+struct timespec output_window_period;
+
 bool output_window_exceeds_threshold(struct process_output_window * window) {
-  if (window->iterations > 10 || window->bytes > PROCESS_OUTPUT_MAX / 10) {
+  if (window->iterations > 10 || window->bytes > window->output_max) {
     return true;
   }
   return false;
@@ -315,9 +322,32 @@ bool output_window_exceeds_threshold(struct process_output_window * window) {
 
 void output_window_reset(struct process_output_window * window) {
   struct timespec now = current_timespec();
-  window->next_window = timespec_add(now, make_timespec(0, 500000000));
   window->iterations = 0;
   window->bytes = 0;
+  window->next_window = timespec_add(now, output_window_period);
+  if (timespec_cmp(window->time, output_window_slow_timeslice) >= 0) {
+    window->output_max = 1024;
+    printf("Scaling down fast %ld\n", window->output_max);
+  } if (timespec_cmp(window->time, output_window_timeslice) >= 0) {
+    window->output_max /= 1.5;
+    window->output_max = max(window->output_max, 1024);
+    printf("Scaling down %ld\n", window->output_max);
+  } else if (timespec_cmp(window->time, output_window_period) >= 0) {
+    // Do nothing
+  } else if (timespec_cmp(window->time, output_window_fast_timeslice) >= 0) {
+    window->output_max *= 1.5;
+    window->output_max = min(window->output_max, PROCESS_OUTPUT_MAX);
+    printf("Scaling up %ld\n", window->output_max);
+  } else if (timespec_cmp(window->time, make_timespec(0, 0)) > 0) {
+    if ( window->output_max > 1024 * 1024) {
+      window->output_max *= 100;
+    } else {
+      window->output_max *= 5;
+    }
+    window->output_max = min(window->output_max, PROCESS_OUTPUT_MAX);
+    printf("Scaling up fast %ld\n", window->output_max);
+  }
+  window->time = make_timespec(0, 0);
 }
 
 static struct process_output_buffer * process_buffers = NULL;
@@ -488,9 +518,9 @@ void process_output_buffer_set_ready_fd(struct process_output_buffer * buffer) {
 struct process_output_window global_output_window;
 
 bool global_output_window_exceeded_threshold() {
-  if (global_output_window.bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE * 10) {
-    return true;
-  }
+  /* if (global_output_window.bytes > MAX_PROCESS_OUTPUT_BUFFER_SIZE) { */
+  /*   return true; */
+  /* } */
   return false;
 }
 
@@ -534,6 +564,19 @@ process_output_setup_for_select() {
   return fd;
 }
 
+void
+process_output_add_time_window(int channel, int pid, struct timespec * time) {
+  process_output_mutex_lock();
+  struct process_output_buffer * buffer = get_process_output_buffer(channel, pid);
+  if (buffer != NULL) {
+    //We only want to care about worst case scenario
+    if (timespec_cmp(*time, buffer->window.time) > 0) {
+      buffer->window.time = *time;
+    }
+  }
+  process_output_mutex_unlock();
+}
+
 ptrdiff_t
 process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
   bool exceeded_global_window = locked_global_output_window_exceeded_threshold();
@@ -543,9 +586,9 @@ process_output_read(int channel, int pid, void * buf, ptrdiff_t nbyte) {
     process_output_mutex_unlock();
     return 0;
   }
-  bool exceeded_process_window = output_window_exceeds_threshold(&buffer->window);
+  //bool exceeded_process_window = output_window_exceeds_threshold(&buffer->window);
 
-  if (!buffer->completed && (exceeded_global_window || exceeded_process_window)) {
+  if (!buffer->completed && (exceeded_global_window)) {
     process_output_mutex_unlock();
     errno = EAGAIN;
     return -1;
@@ -649,6 +692,8 @@ void process_output_track_fd(int channel, int pid, int fd) {
   buffer->released = false;
   buffer->output_tick = process_output_tick;
   buffer->prev = NULL;
+  buffer->window.output_max = 1024 * 1024;
+  buffer->window.time = make_timespec(0, 0);
   output_window_reset(&buffer->window);
   buffer->window.fd = buffer->fd;
 
@@ -676,6 +721,7 @@ void * process_output_consumer_thread(void * args) {
   fd_set outputting_fds;
   fd_set tracked_fds;
   struct process_output_window output_window;
+  output_window.output_max = MAX_PROCESS_OUTPUT_BUFFER_SIZE;
   output_window_reset(&output_window);
 
   FD_ZERO(&ready_fds);
@@ -683,7 +729,7 @@ void * process_output_consumer_thread(void * args) {
   FD_ZERO(&tracked_fds);
   while (1) {
     struct timespec now = current_timespec();
-    if (timespec_cmp(output_window.next_window, now) > 0) {
+    if (timespec_cmp(now, output_window.next_window) > 0) {
       output_window_reset(&output_window);
     } else if (output_window.iterations > 100) {
       struct timespec timeout = timespec_sub(output_window.next_window, now);
@@ -707,9 +753,12 @@ void * process_output_consumer_thread(void * args) {
     int maxFd = notify_fd;
     int readingCount = 0;
     bool has_output = false;
-    struct timespec buffer_timeout = make_timespec(10, 0);
+    struct timespec buffer_timeout = make_timespec(0, 100000000);
     while (buffer != NULL) {
-      if (buffer->completed || buffer->buffer_size >= MAX_PROCESS_OUTPUT_BUFFER_SIZE) {
+      if (timespec_cmp(now, buffer->window.next_window) >= 0) {
+        output_window_reset(&buffer->window);
+      }
+      if (buffer->completed || buffer->buffer_size >= buffer->window.output_max) {
         struct process_output_buffer * next = buffer->next;
         if (buffer->released) {
           FD_CLR(buffer->fd, &tracked_fds);
@@ -737,7 +786,7 @@ void * process_output_consumer_thread(void * args) {
         maxFd = fd;
       }
       FD_SET(fd, &fds);
-      const intmax_t outputSize = MAX_PROCESS_OUTPUT_BUFFER_SIZE - buffer->buffer_size;
+      const intmax_t outputSize = min(MAX_PROCESS_OUTPUT_BUFFER_SIZE, buffer->window.output_max) - buffer->buffer_size;
       intmax_t updatedSize;
       if (FD_ISSET(fd, &ready_fds) || FD_ISSET(fd, &outputting_fds) || !FD_ISSET(fd, &tracked_fds)) {
         process_output_mutex_unlock();
@@ -803,6 +852,15 @@ void * process_output_consumer_thread(void * args) {
 }
 
 void start_process_output_consumer_thread() {
+  output_window_slow_timeslice =
+    make_timespec(0, 500000000);
+  output_window_timeslice =
+    make_timespec(0, 100000000);
+  output_window_fast_timeslice =
+    make_timespec(0, 10000000);
+  output_window_period =
+    make_timespec(0, 100000000);
+
   FD_ZERO(&process_output_ready_fds);
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
@@ -836,8 +894,8 @@ void start_process_output_consumer_thread() {
   if (pthread_create(&process_buffer_thread, NULL, &process_output_consumer_thread, NULL) != 0) {
     emacs_perror("Failed to create process output consumer");
   }
-
-  output_window_reset(&global_output_window);
+ output_window_reset(&global_output_window);
+ global_output_window.time = make_timespec(0, 0);
   global_output_window.fd = -1;
 }
 
@@ -6651,7 +6709,10 @@ read_and_dispose_of_process_output (struct Lisp_Process *p, char *chars,
     ssize_t nbytes,
     struct coding_system *coding);
 
-char process_output_buffer[PROCESS_OUTPUT_MAX];
+
+static const intmax_t READ_PROCESS_OUTPUT_MAX = 1024 * 1024 * 100;
+char process_output_buffer[READ_PROCESS_OUTPUT_MAX];
+
 /* Read pending output from the process channel,
    starting with our buffered-ahead character if we have one.
    Yield number of decoded characters read,
@@ -6761,8 +6822,11 @@ read_process_output (Lisp_Object proc, int channel)
      buffer, and many callers of accept-process-output, sit-for, and
      friends don't expect current-buffer to be changed from under them.  */
   record_unwind_current_buffer ();
-
+  struct timespec start = current_timespec();
   read_and_dispose_of_process_output (p, process_output_buffer, nbytes, coding);
+  struct timespec time = timespec_sub(current_timespec(), start);
+  process_output_add_time_window(channel, p->pid, &time);
+
 
   /* Handling the process output should not deactivate the mark.  */
   Vdeactivate_mark = odeactivate;
@@ -8120,7 +8184,7 @@ status_notify (struct Lisp_Process *deleting_process,
                                                         proc))
                   && got_some_output < nread)
                 got_some_output = nread;
-              if (nread <= 0)
+              if (nread <= 0 || !updated_tick)
                 break;
             }
 
