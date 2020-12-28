@@ -4350,6 +4350,61 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
   unbind_to (count, Qnil);
 }
 
+static Lisp_Object
+network_lookup_address_info_1 (Lisp_Object host, const char *service,
+                               struct addrinfo *hints, struct addrinfo **res)
+{
+  Lisp_Object msg = Qt;
+  int ret;
+
+  if (STRING_MULTIBYTE (host) && SBYTES (host) != SCHARS (host))
+    error ("Non-ASCII hostname %s detected, please use puny-encode-domain",
+           SSDATA (host));
+  ret = getaddrinfo (SSDATA (host), service, hints, res);
+  if (ret)
+    {
+      /* We pass NULL for unspecified port, because some versions of
+	 Darwin return EAI_NONAME for getaddrinfo ("localhost", "0",
+	 ...).  */
+#if 0
+      if (service == NULL)
+        service = "0";
+#endif
+#ifdef HAVE_GAI_STRERROR
+      synchronize_system_messages_locale ();
+      char const *str = gai_strerror (ret);
+      if (! NILP (Vlocale_coding_system))
+        str = SSDATA (code_convert_string_norecord
+                      (build_string (str), Vlocale_coding_system, 0));
+      if (service)
+	{
+	  AUTO_STRING (format, "%s/%s %s");
+	  msg = CALLN (Fformat, format, host, build_string (service),
+		       build_string (str));
+	}
+      else
+	{
+	  AUTO_STRING (format, "%s %s");
+	  msg = CALLN (Fformat, format, host, build_string (str));
+	}
+#else
+      if (service)
+	{
+	  AUTO_STRING (format, "%s/%s getaddrinfo error %d");
+	  msg = CALLN (Fformat, format, host, build_string (service),
+		       make_int (ret));
+	}
+      else
+	{
+	  AUTO_STRING (format, "%s getaddrinfo error %d");
+	  msg = CALLN (Fformat, format, host, make_int (ret));
+	}
+#endif
+    }
+   return msg;
+}
+
+
 /* Create a network stream/datagram client/server process.  Treated
    exactly like a normal process when reading and writing.  Primary
    differences are in status display and process deletion.  A network
@@ -5262,59 +5317,7 @@ DEFUN ("network-interface-info", Fnetwork_interface_info,
 #endif
 }
 
-static Lisp_Object
-network_lookup_address_info_1 (Lisp_Object host, const char *service,
-                               struct addrinfo *hints, struct addrinfo **res)
-{
-  Lisp_Object msg = Qt;
-  int ret;
 
-  if (STRING_MULTIBYTE (host) && SBYTES (host) != SCHARS (host))
-    error ("Non-ASCII hostname %s detected, please use puny-encode-domain",
-           SSDATA (host));
-  ret = getaddrinfo (SSDATA (host), service, hints, res);
-  if (ret)
-    {
-      /* We pass NULL for unspecified port, because some versions of
-	 Darwin return EAI_NONAME for getaddrinfo ("localhost", "0",
-	 ...).  */
-#if 0
-      if (service == NULL)
-        service = "0";
-#endif
-#ifdef HAVE_GAI_STRERROR
-      synchronize_system_messages_locale ();
-      char const *str = gai_strerror (ret);
-      if (! NILP (Vlocale_coding_system))
-        str = SSDATA (code_convert_string_norecord
-                      (build_string (str), Vlocale_coding_system, 0));
-      if (service)
-	{
-	  AUTO_STRING (format, "%s/%s %s");
-	  msg = CALLN (Fformat, format, host, build_string (service),
-		       build_string (str));
-	}
-      else
-	{
-	  AUTO_STRING (format, "%s %s");
-	  msg = CALLN (Fformat, format, host, build_string (str));
-	}
-#else
-      if (service)
-	{
-	  AUTO_STRING (format, "%s/%s getaddrinfo error %d");
-	  msg = CALLN (Fformat, format, host, build_string (service),
-		       make_int (ret));
-	}
-      else
-	{
-	  AUTO_STRING (format, "%s getaddrinfo error %d");
-	  msg = CALLN (Fformat, format, host, make_int (ret));
-	}
-#endif
-    }
-   return msg;
-}
 
 DEFUN ("network-lookup-address-info", Fnetwork_lookup_address_info,
        Snetwork_lookup_address_info, 1, 2, 0,
@@ -6670,7 +6673,6 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
   if (read_kbd >= 0)
     {
       /* Prevent input_pending from remaining set if we quit.  */
-      g ();
       maybe_quit ();
     }
 
